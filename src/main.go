@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"personal/discord_go/src/client"
 
 	"github.com/joho/godotenv"
 )
@@ -15,7 +16,7 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
-	bot := client.newBot(os.Getenv("DISCORD_TOKEN"))
+	bot := client.NewBot()
 
-	bot.connectToGateway()
+	bot.ConnectToGateway(os.Getenv("DISCORD_TOKEN"))
 }
