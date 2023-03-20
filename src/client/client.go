@@ -205,7 +205,7 @@ func (c *Client) StartListening() {
 	for {
 		select {
 		case messageBody := <-c.messageChannel:
-			var message GenericMessage
+			var message Packet
 
 			err := json.Unmarshal(messageBody, &message)
 
@@ -218,8 +218,16 @@ func (c *Client) StartListening() {
 			switch message.T {
 			case "READY":
 				fmt.Println("StartListening: received READY event")
-				c.sessionId = message.D["session_id"].(string)
-				c.resumeUrl = message.D["resume_gateway_url"].(string)
+				var data ReadyData
+				err := json.Unmarshal(message.D, &data)
+
+				if err != nil {
+					fmt.Printf("StartListening: could not unmarshal READY event data: %s\n", err)
+					return
+				}
+
+				c.sessionId = ReadyData.SessionId
+				c.resumeUrl = ReadyData.ResumeUrl
 				c.lastHeartbeatAcked = true
 				c.SendHeartbeat()
 			default:

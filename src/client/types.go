@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -53,11 +54,16 @@ type IdentifyData struct {
 	Intents        int         `json:"intents"`
 }
 
-type GenericMessage struct {
-	Op int                    `json:"op"`
-	T  string                 `json:"t"`
-	D  map[string]interface{} `json:"d"`
-	S  int64                  `json:"s"`
+type Packet struct {
+	Op int             `json:"op"`
+	T  string          `json:"t"`
+	D  json.RawMessage `json:"d"`
+	S  int64           `json:"s"`
+}
+
+type ReadyData {
+	SessionId string `json:"session_id"`
+	ResumeUrl string `json:"resume_gateway_url"`
 }
 
 type HeartbeatMessage struct {
