@@ -1,24 +1,44 @@
+// Package client: the actual websocket client to the Discord gateway
 package client
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
-	"personal/discord_go/src/opcodes"
 	"time"
+
+	"personal/discord_go/src/opcodes"
 
 	"github.com/gorilla/websocket"
 )
 
-const DISCORD_API = "https://discordapp.com/api/v6"
+type Client struct {
+	token  string
+	prefix string
 
-func NewBot() *Client {
+	gateway       string
+	sessionId     string
+	resumeGateway string
+
+	heartbeatTimer         *time.Timer
+	heartbeatInterval      int
+	lastHeartbeatAcked     bool
+	lastHeartbeatTimestamp int64
+	sequence               int64
+	isResuming             bool
+
+	connection     *websocket.Conn
+	messageChannel chan []byte
+}
+
+func NewBot(token string, prefix string) *Client {
 	// make http request to DISCORD_API/gateway
-	requestURL := DISCORD_API + "/gateway"
+	requestURL := DiscordAPI + "/gateway/bot"
 
 	req, err := http.NewRequest("GET", requestURL, nil)
+	req.Header.Set("Authorization", fmt.Sprintf("Bot %s", token))
 	if err != nil {
 		fmt.Printf("client: could not create request: %s\n", err)
 		os.Exit(1)
@@ -32,7 +52,7 @@ func NewBot() *Client {
 
 	fmt.Printf("client: status code: %d\n", res.StatusCode)
 
-	resBody, err := ioutil.ReadAll(res.Body)
+	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
 		fmt.Printf("client: could not read response body: %s\n", err)
 		os.Exit(1)
@@ -46,12 +66,12 @@ func NewBot() *Client {
 		os.Exit(1)
 	}
 
-	return &Client{gateway: response.Url, sequence: -1}
+	return &Client{token: token, gateway: response.Url, sequence: -1}
 }
 
-func (c *Client) ConnectToGateway(token string) {
+func (c *Client) ConnectToGateway() {
 	if c.gateway == "" {
-		fmt.Println("Gateway not set")
+		fmt.Println("ConnectToGateway: Gateway not set")
 		return
 	}
 
@@ -87,10 +107,10 @@ func (c *Client) ConnectToGateway(token string) {
 	c.setHeartbeatInterval(c.heartbeatInterval)
 	fmt.Printf("ConnectToGateway: Successfully made handshake; heartbeat interval: %d\n", c.heartbeatInterval)
 
-	c.Identify(token)
+	c.identify()
 }
 
-func (c *Client) Identify(token string) {
+func (c *Client) identify() {
 	if c.connection == nil {
 		fmt.Println("Identify: connection is not open")
 		return
@@ -99,7 +119,7 @@ func (c *Client) Identify(token string) {
 	identifyMessage := IdentifyMessage{
 		Op: opcodes.Identify,
 		D: IdentifyData{
-			Token: token,
+			Token: c.token,
 			Properties: struct {
 				Os      string `json:"$os"`
 				Browser string `json:"$browser"`
@@ -109,19 +129,18 @@ func (c *Client) Identify(token string) {
 				Browser: "discord_go",
 				Device:  "discord_go",
 			},
-			Shard: []int{0, 1},
+			Shard:   []int{0, 1},
+			Intents: Intents,
 		},
 	}
 
-	identifyMessageBody, err := json.Marshal(identifyMessage)
-
+	payload, err := json.Marshal(identifyMessage)
 	if err != nil {
 		fmt.Printf("Identify: could not marshal identify message: %s\n", err)
 		return
 	}
 
-	err = c.connection.WriteMessage(websocket.TextMessage, identifyMessageBody)
-
+	err = c.connection.WriteMessage(websocket.TextMessage, payload)
 	if err != nil {
 		fmt.Printf("Identify: could not send identify message: %s\n", err)
 		return
@@ -129,10 +148,10 @@ func (c *Client) Identify(token string) {
 
 	fmt.Println("Identify: sent identify message")
 
-	c.StartListening()
+	c.startListening()
 }
 
-func (c *Client) SendHeartbeat() {
+func (c *Client) sendHeartbeat() {
 	if !c.lastHeartbeatAcked {
 		// TODO: handle this
 
@@ -148,15 +167,13 @@ func (c *Client) SendHeartbeat() {
 		D:  c.sequence,
 	}
 
-	heartbeatMessageBody, err := json.Marshal(heartbeatMessage)
-
+	payload, err := json.Marshal(heartbeatMessage)
 	if err != nil {
 		fmt.Printf("SendHeartbeat: could not marshal heartbeat message: %s\n", err)
 		return
 	}
 
-	err = c.connection.WriteMessage(websocket.TextMessage, heartbeatMessageBody)
-
+	err = c.connection.WriteMessage(websocket.TextMessage, payload)
 	if err != nil {
 		fmt.Printf("SendHeartbeat: could not send heartbeat message: %s\n", err)
 		return
@@ -174,12 +191,12 @@ func (c *Client) setHeartbeatInterval(timeToWait int) {
 
 	fmt.Printf("setHeartbeatInterval: setting heartbeat timer to %d milliseconds \n", timeToWait)
 	c.heartbeatTimer = time.AfterFunc(time.Duration(timeToWait)*time.Millisecond, func() {
-		c.SendHeartbeat()
+		c.sendHeartbeat()
 		c.setHeartbeatInterval(timeToWait)
 	})
 }
 
-func (c *Client) StartListening() {
+func (c *Client) startListening() {
 	if c.connection == nil {
 		fmt.Println("StartListening: connection is not open")
 		return
@@ -202,55 +219,63 @@ func (c *Client) StartListening() {
 		}
 	}()
 
-	for {
-		select {
-		case messageBody := <-c.messageChannel:
-			var message Packet
+	for messageBody := range c.messageChannel {
+		var message Packet
 
-			err := json.Unmarshal(messageBody, &message)
+		err := json.Unmarshal(messageBody, &message)
+		if err != nil {
+			fmt.Printf("StartListening: could not unmarshal message body: %s\n", err)
+			fmt.Println(string(messageBody))
+			return
+		}
 
+		switch message.T {
+		case "READY":
+			fmt.Println("StartListening: received READY event")
+			var data ReadyData
+			err := json.Unmarshal(message.D, &data)
 			if err != nil {
-				fmt.Printf("StartListening: could not unmarshal message body: %s\n", err)
-				fmt.Println(string(messageBody))
+				fmt.Printf("StartListening: could not unmarshal READY event data: %s\n", err)
 				return
 			}
 
-			switch message.T {
-			case "READY":
-				fmt.Println("StartListening: received READY event")
-				var data ReadyData
-				err := json.Unmarshal(message.D, &data)
-
-				if err != nil {
-					fmt.Printf("StartListening: could not unmarshal READY event data: %s\n", err)
-					return
-				}
-
-				c.sessionId = ReadyData.SessionId
-				c.resumeUrl = ReadyData.ResumeUrl
-				c.lastHeartbeatAcked = true
-				c.SendHeartbeat()
-			default:
-				// TODO: resumed event
-			}
-
-			switch message.Op {
-			case opcodes.HeartbeatACK:
-				c.AcknowledgeHeartbeat()
-			case opcodes.Heartbeat:
-				c.SendHeartbeat()
-			default:
-				fmt.Printf("StartListening: received unknown message type: %d\n", message.Op)
-			}
-
-			if message.S > c.sequence {
-				c.sequence = message.S
-			}
+			c.sessionId = data.SessionId
+			c.resumeGateway = data.ResumeUrl
+			c.lastHeartbeatAcked = true
+			c.sendHeartbeat()
+		case "RESUMED":
+			// finished resuming, all subsequent events are new events.
+			c.isResuming = false
+		default:
+			fmt.Printf("Received uknown message type %s", message.T)
 		}
+
+		switch message.Op {
+		case opcodes.HeartbeatACK:
+			c.acknowledgeHeartbeat()
+		case opcodes.Heartbeat:
+			c.sendHeartbeat()
+		case opcodes.Reconnect:
+			c.resumeOldConnection()
+		case opcodes.Dispatch:
+			c.sequence = message.S
+			c.onEvent(message.D)
+		case opcodes.InvalidSession:
+			// failed to connect to gateway for some reason
+			c.handleInvalidSession(message.D)
+
+		default:
+			fmt.Printf("StartListening: received unknown message type: %d\n", message.Op)
+		}
+
+		if message.S > c.sequence {
+			c.sequence = message.S
+		}
+
 	}
 }
 
-func (c *Client) AcknowledgeHeartbeat() {
+func (c *Client) acknowledgeHeartbeat() {
 	fmt.Println("AcknowledgeHeartbeat: received heartbeat ACK")
 	c.lastHeartbeatAcked = true
 	c.lastHeartbeatTimestamp = time.Now().UnixNano() / int64(time.Millisecond)
@@ -258,4 +283,65 @@ func (c *Client) AcknowledgeHeartbeat() {
 
 func (c *Client) GetGateway() string {
 	return c.gateway
+}
+
+func (c *Client) resumeOldConnection() {
+	if c.resumeGateway == "" {
+		fmt.Println("resumeOldConnection: Resume gateway not set")
+		return
+	}
+
+	c.isResuming = true
+	conn, _, err := websocket.DefaultDialer.Dial(c.resumeGateway, http.Header{})
+	if err != nil {
+		fmt.Printf("resumeOldConnection: could not connect to WebSocket: %s\n", err)
+		return
+	}
+
+	c.connection = conn
+
+	// Have to send gateway resume event
+	resumeMessage := ResumeMessage{
+		Op: opcodes.Resume,
+		D: ResumeData{
+			Token:     c.token,
+			SessionID: c.sessionId,
+			Sequence:  c.sequence,
+		},
+	}
+
+	payload, err := json.Marshal(resumeMessage)
+	if err != nil {
+		fmt.Printf("resumeOldConnection: could not marshal heartbeat message: %s\n", err)
+		return
+	}
+
+	err = c.connection.WriteMessage(websocket.TextMessage, payload)
+	if err != nil {
+		fmt.Printf("resumeOldConnection: could not send resume message: %s\n", err)
+		return
+	}
+
+	fmt.Println("resumeOldConnection: sent resume message")
+}
+
+func (c *Client) onEvent(data json.RawMessage) {
+}
+
+func (c *Client) handleInvalidSession(data json.RawMessage) {
+	var canResume bool
+	err := json.Unmarshal(data, &canResume)
+	if err != nil {
+		fmt.Printf("client: could not unmarshal response body: %s\n", err)
+		os.Exit(1)
+	}
+
+	if canResume {
+		c.resumeOldConnection()
+	} else {
+		newClient := NewBot(c.token)
+		newClient.ConnectToGateway()
+
+		c = newClient
+	}
 }
