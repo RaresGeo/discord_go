@@ -1,105 +1,139 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"os"
-	"personal/discord_go/src/opcodes"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"personal/discord_go/src/opcodes"
 
 	"github.com/gorilla/websocket"
 )
 
-const DISCORD_API = "https://discordapp.com/api/v6"
+type Client struct {
+	token      string
+	httpClient *http.Client
+	prefix     string
 
-func NewBot() *Client {
-	// make http request to DISCORD_API/gateway
-	requestURL := DISCORD_API + "/gateway"
+	mu            sync.RWMutex
+	gateway       string
+	sessionId     string
+	resumeGateway string
+
+	heartbeatInterval      atomic.Int64
+	lastHeartbeatAcked     atomic.Bool
+	lastHeartbeatTimestamp atomic.Int64
+	sequence               atomic.Int64
+	isResuming             atomic.Bool
+	connection             atomic.Pointer[websocket.Conn]
+
+	messageChannel chan []byte
+}
+
+func NewBot(token string, prefix string) (*Client, error) {
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	requestURL := DiscordAPI + "/gateway/bot"
 
 	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {
-		fmt.Printf("client: could not create request: %s\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("could not create request: %w", err)
 	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bot %s", token))
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
-		fmt.Printf("client: error making http request: %s\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("error making http request: %w", err)
 	}
+	defer res.Body.Close()
 
-	fmt.Printf("client: status code: %d\n", res.StatusCode)
+	fmt.Printf("client: gateway response status code: %d\n", res.StatusCode)
 
-	resBody, err := ioutil.ReadAll(res.Body)
+	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		fmt.Printf("client: could not read response body: %s\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("could not read response body: %w", err)
 	}
 
-	// get .url from resBody
 	var response GatewayResponse
 	err = json.Unmarshal(resBody, &response)
 	if err != nil {
-		fmt.Printf("client: could not unmarshal response body: %s\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("could not unmarshal response body: %w", err)
 	}
 
-	return &Client{gateway: response.Url, sequence: -1}
+	client := &Client{
+		token:      token,
+		prefix:     prefix,
+		gateway:    response.Url,
+		httpClient: httpClient,
+	}
+
+	client.sequence.Store(-1)
+	client.lastHeartbeatAcked.Store(true)
+
+	return client, nil
 }
 
-func (c *Client) ConnectToGateway(token string) {
+// ConnectToGateway establishes a WebSocket connection to Discord's gateway and
+// starts the main event loop. It will block until the context is cancelled or
+// an error occurs. Returns an error if the connection fails.
+func (c *Client) ConnectToGateway(ctx context.Context) error {
 	if c.gateway == "" {
-		fmt.Println("Gateway not set")
-		return
+		return fmt.Errorf("gateway URL not set")
 	}
 
 	conn, _, err := websocket.DefaultDialer.Dial(c.gateway, http.Header{})
 	if err != nil {
-		fmt.Printf("ConnectToGateway: could not connect to WebSocket: %s\n", err)
-		return
+		return fmt.Errorf("could not connect to WebSocket: %w", err)
 	}
 
-	c.connection = conn
+	c.connection.Store(conn)
 
-	// First message should be hello
-	_, messageBody, err := c.connection.ReadMessage()
+	_, messageBody, err := conn.ReadMessage()
 	if err != nil {
-		fmt.Printf("ConnectToGateway: could not receive message from WebSocket: %s\n", err)
-		return
+		return fmt.Errorf("could not receive hello message: %w", err)
 	}
 
-	// Unmarshal message body
 	var message HelloMessage
 	err = json.Unmarshal(messageBody, &message)
 	if err != nil {
-		fmt.Printf("ConnectToGateway: could not unmarshal message body: %s\n", err)
-		return
+		return fmt.Errorf("could not unmarshal hello message: %w", err)
 	}
 
 	if message.Op != opcodes.Hello {
-		fmt.Printf("ConnectToGateway: invalid handshake, expected Hello, got %d\n", message.Op)
-		return
+		return fmt.Errorf("invalid handshake: expected Hello (opcode %d), got %d", opcodes.Hello, message.Op)
 	}
 
-	c.heartbeatInterval = message.D.HeartbeatInterval
-	c.setHeartbeatInterval(c.heartbeatInterval)
-	fmt.Printf("ConnectToGateway: Successfully made handshake; heartbeat interval: %d\n", c.heartbeatInterval)
+	interval := time.Duration(message.D.HeartbeatInterval) * time.Millisecond
+	c.heartbeatInterval.Store(int64(interval))
 
-	c.Identify(token)
+	fmt.Printf("ConnectToGateway: Successfully made handshake; heartbeat interval: %v\n", c.heartbeatInterval)
+
+	if err := c.identify(); err != nil {
+		return fmt.Errorf("failed to identify: %w", err)
+	}
+
+	go c.startHeartbeat(ctx)
+
+	return c.startListening(ctx)
 }
 
-func (c *Client) Identify(token string) {
-	if c.connection == nil {
-		fmt.Println("Identify: connection is not open")
-		return
+func (c *Client) identify() error {
+	conn := c.connection.Load()
+	if conn == nil {
+		return fmt.Errorf("connection is not open")
 	}
 
 	identifyMessage := IdentifyMessage{
 		Op: opcodes.Identify,
 		D: IdentifyData{
-			Token: token,
+			Token: c.token,
 			Properties: struct {
 				Os      string `json:"$os"`
 				Browser string `json:"$browser"`
@@ -109,153 +143,248 @@ func (c *Client) Identify(token string) {
 				Browser: "discord_go",
 				Device:  "discord_go",
 			},
-			Shard: []int{0, 1},
+			Shard:   []int{0, 1},
+			Intents: Intents,
 		},
 	}
 
-	identifyMessageBody, err := json.Marshal(identifyMessage)
-
+	payload, err := json.Marshal(identifyMessage)
 	if err != nil {
-		fmt.Printf("Identify: could not marshal identify message: %s\n", err)
-		return
+		return fmt.Errorf("could not marshal identify message: %w", err)
 	}
 
-	err = c.connection.WriteMessage(websocket.TextMessage, identifyMessageBody)
-
+	err = conn.WriteMessage(websocket.TextMessage, payload)
 	if err != nil {
-		fmt.Printf("Identify: could not send identify message: %s\n", err)
-		return
+		return fmt.Errorf("could not send identify message: %w", err)
 	}
 
 	fmt.Println("Identify: sent identify message")
-
-	c.StartListening()
+	return nil
 }
 
-func (c *Client) SendHeartbeat() {
-	if !c.lastHeartbeatAcked {
-		// TODO: handle this
+func (c *Client) startHeartbeat(ctx context.Context) {
+	interval := time.Duration(c.heartbeatInterval.Load())
 
-		fmt.Println("SendHeartbeat: Last heartbeat was not acknowledged, reconnecting")
-		return
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	fmt.Printf("startHeartbeat: starting heartbeat with interval %v\n", interval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("startHeartbeat: context cancelled, stopping heartbeat")
+			return
+		case <-ticker.C:
+			if err := c.sendHeartbeat(); err != nil {
+				fmt.Printf("startHeartbeat: failed to send heartbeat: %v\n", err)
+			}
+		}
+	}
+}
+
+func (c *Client) sendHeartbeat() error {
+	if !c.lastHeartbeatAcked.Load() {
+		return fmt.Errorf("last heartbeat was not acknowledged")
 	}
 
-	c.lastHeartbeatAcked = false
-	c.lastHeartbeatTimestamp = time.Now().UnixNano() / int64(time.Millisecond)
+	c.lastHeartbeatAcked.Store(false)
+	c.lastHeartbeatTimestamp.Store(time.Now().UnixNano() / int64(time.Millisecond))
+
+	seq := c.sequence.Load()
+	conn := c.connection.Load()
+
+	if conn == nil {
+		return fmt.Errorf("connection is nil")
+	}
 
 	heartbeatMessage := HeartbeatMessage{
 		Op: opcodes.Heartbeat,
-		D:  c.sequence,
+		D:  seq,
 	}
 
-	heartbeatMessageBody, err := json.Marshal(heartbeatMessage)
-
+	payload, err := json.Marshal(heartbeatMessage)
 	if err != nil {
-		fmt.Printf("SendHeartbeat: could not marshal heartbeat message: %s\n", err)
-		return
+		return fmt.Errorf("could not marshal heartbeat message: %w", err)
 	}
 
-	err = c.connection.WriteMessage(websocket.TextMessage, heartbeatMessageBody)
-
-	if err != nil {
-		fmt.Printf("SendHeartbeat: could not send heartbeat message: %s\n", err)
-		return
+	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		return fmt.Errorf("could not send heartbeat message: %w", err)
 	}
 
-	fmt.Println("SendHeartbeat: sent heartbeat message")
+	fmt.Println("sendHeartbeat: sent heartbeat message")
+	return nil
 }
 
-func (c *Client) setHeartbeatInterval(timeToWait int) {
-	if timeToWait == -1 {
-		// Stop timer
-		c.heartbeatTimer.Stop()
-		return
+func (c *Client) startListening(ctx context.Context) error {
+	conn := c.connection.Load()
+	if conn == nil {
+		return fmt.Errorf("connection is not open")
 	}
 
-	fmt.Printf("setHeartbeatInterval: setting heartbeat timer to %d milliseconds \n", timeToWait)
-	c.heartbeatTimer = time.AfterFunc(time.Duration(timeToWait)*time.Millisecond, func() {
-		c.SendHeartbeat()
-		c.setHeartbeatInterval(timeToWait)
-	})
-}
+	fmt.Println("startListening: started listening for messages")
 
-func (c *Client) StartListening() {
-	if c.connection == nil {
-		fmt.Println("StartListening: connection is not open")
-		return
-	}
-
-	fmt.Println("StartListening: started listening for messages")
-
-	c.messageChannel = make(chan []byte)
+	c.messageChannel = make(chan []byte, 10)
+	errCh := make(chan error, 1)
 
 	go func() {
+		defer close(c.messageChannel)
 		for {
-			_, messageBody, err := c.connection.ReadMessage()
+			_, messageBody, err := conn.ReadMessage()
 			if err != nil {
-				fmt.Printf("StartListening: could not receive message from WebSocket: %s\n", err)
-				close(c.messageChannel)
+				errCh <- fmt.Errorf("could not receive message from WebSocket: %w", err)
 				return
 			}
 
-			c.messageChannel <- messageBody
+			select {
+			case c.messageChannel <- messageBody:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
 	for {
 		select {
-		case messageBody := <-c.messageChannel:
-			var message Packet
+		case <-ctx.Done():
+			fmt.Println("startListening: context cancelled, closing connection")
+			if conn := c.connection.Load(); conn != nil {
+				conn.Close()
+			}
+			return ctx.Err()
 
-			err := json.Unmarshal(messageBody, &message)
+		case err := <-errCh:
+			return err
 
-			if err != nil {
-				fmt.Printf("StartListening: could not unmarshal message body: %s\n", err)
-				fmt.Println(string(messageBody))
-				return
+		case messageBody, ok := <-c.messageChannel:
+			if !ok {
+				return fmt.Errorf("message channel closed")
 			}
 
-			switch message.T {
-			case "READY":
-				fmt.Println("StartListening: received READY event")
-				var data ReadyData
-				err := json.Unmarshal(message.D, &data)
-
-				if err != nil {
-					fmt.Printf("StartListening: could not unmarshal READY event data: %s\n", err)
-					return
-				}
-
-				c.sessionId = ReadyData.SessionId
-				c.resumeUrl = ReadyData.ResumeUrl
-				c.lastHeartbeatAcked = true
-				c.SendHeartbeat()
-			default:
-				// TODO: resumed event
-			}
-
-			switch message.Op {
-			case opcodes.HeartbeatACK:
-				c.AcknowledgeHeartbeat()
-			case opcodes.Heartbeat:
-				c.SendHeartbeat()
-			default:
-				fmt.Printf("StartListening: received unknown message type: %d\n", message.Op)
-			}
-
-			if message.S > c.sequence {
-				c.sequence = message.S
+			if err := c.handleMessage(messageBody); err != nil {
+				fmt.Printf("startListening: error handling message: %v\n", err)
 			}
 		}
 	}
 }
 
-func (c *Client) AcknowledgeHeartbeat() {
-	fmt.Println("AcknowledgeHeartbeat: received heartbeat ACK")
-	c.lastHeartbeatAcked = true
-	c.lastHeartbeatTimestamp = time.Now().UnixNano() / int64(time.Millisecond)
+func (c *Client) handleMessage(messageBody []byte) error {
+	var message Packet
+	if err := json.Unmarshal(messageBody, &message); err != nil {
+		return fmt.Errorf("could not unmarshal message body: %w (body: %s)", err, string(messageBody))
+	}
+
+	switch message.T {
+	case "READY":
+		fmt.Println("handleMessage: received READY event")
+		var data ReadyData
+		if err := json.Unmarshal(message.D, &data); err != nil {
+			return fmt.Errorf("could not unmarshal READY event data: %w", err)
+		}
+
+		c.mu.Lock()
+		c.sessionId = data.SessionId
+		c.resumeGateway = data.ResumeUrl
+		c.mu.Unlock()
+
+		c.lastHeartbeatAcked.Store(true)
+
+		if err := c.sendHeartbeat(); err != nil {
+			fmt.Printf("handleMessage: failed to send initial heartbeat: %v\n", err)
+		}
+
+	case "RESUMED":
+		fmt.Println("handleMessage: received RESUMED event")
+		c.isResuming.Store(false)
+
+	case "":
+	default:
+		fmt.Printf("handleMessage: received event type: %s\n", message.T)
+	}
+
+	switch message.Op {
+	case opcodes.HeartbeatACK:
+		c.acknowledgeHeartbeat()
+
+	case opcodes.Heartbeat:
+		if err := c.sendHeartbeat(); err != nil {
+			return fmt.Errorf("failed to send requested heartbeat: %w", err)
+		}
+
+	case opcodes.Reconnect:
+		return fmt.Errorf("received reconnect opcode - TODO: implement reconnection")
+
+	case opcodes.Dispatch:
+		c.sequence.Store(message.S)
+		c.onEvent(message.D)
+
+	case opcodes.InvalidSession:
+		return c.handleInvalidSession(message.D)
+
+	default:
+		fmt.Printf("handleMessage: received unknown opcode: %d\n", message.Op)
+	}
+
+	// Update sequence if message has one (lock-free compare-and-swap pattern)
+	if message.S > 0 {
+		for {
+			oldSeq := c.sequence.Load()
+			if message.S <= oldSeq {
+				break
+			}
+			if c.sequence.CompareAndSwap(oldSeq, message.S) {
+				break
+			}
+		}
+	}
+
+	return nil
 }
 
-func (c *Client) GetGateway() string {
-	return c.gateway
+func (c *Client) acknowledgeHeartbeat() {
+	fmt.Println("acknowledgeHeartbeat: received heartbeat ACK")
+	c.lastHeartbeatAcked.Store(true)
+	c.lastHeartbeatTimestamp.Store(time.Now().UnixNano() / int64(time.Millisecond))
+}
+
+func (c *Client) onEvent(data json.RawMessage) {
+}
+
+func (c *Client) handleInvalidSession(data json.RawMessage) error {
+	var canResume bool
+	if err := json.Unmarshal(data, &canResume); err != nil {
+		return fmt.Errorf("could not unmarshal invalid session data: %w", err)
+	}
+
+	if canResume {
+		return fmt.Errorf("received invalid session (resumable)")
+	}
+
+	return fmt.Errorf("received invalid session (not resumable)")
+}
+
+func (c *Client) Disconnect() error {
+	conn := c.connection.Load()
+	if conn == nil {
+		return nil
+	}
+
+	fmt.Println("Disconnect: closing WebSocket connection")
+
+	err := conn.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+	)
+	if err != nil {
+		fmt.Printf("Disconnect: failed to send close message: %v\n", err)
+	}
+
+	if err := conn.Close(); err != nil {
+		return fmt.Errorf("failed to close connection: %w", err)
+	}
+
+	c.connection.Store(nil)
+
+	fmt.Println("Disconnect: connection closed successfully")
+	return nil
 }

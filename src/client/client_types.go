@@ -2,25 +2,9 @@ package client
 
 import (
 	"encoding/json"
-	"time"
-
-	"github.com/gorilla/websocket"
 )
 
-type Client struct {
-	gateway   string
-	sessionId string
-	resumeUrl string
-
-	heartbeatTimer         *time.Timer
-	heartbeatInterval      int
-	lastHeartbeatAcked     bool
-	lastHeartbeatTimestamp int64
-	sequence               int64
-
-	connection     *websocket.Conn
-	messageChannel chan []byte
-}
+type Snowflake string
 
 type GatewayResponse struct {
 	Url string `json:"url"`
@@ -54,14 +38,7 @@ type IdentifyData struct {
 	Intents        int         `json:"intents"`
 }
 
-type Packet struct {
-	Op int             `json:"op"`
-	T  string          `json:"t"`
-	D  json.RawMessage `json:"d"`
-	S  int64           `json:"s"`
-}
-
-type ReadyData {
+type ReadyData struct {
 	SessionId string `json:"session_id"`
 	ResumeUrl string `json:"resume_gateway_url"`
 }
@@ -69,4 +46,22 @@ type ReadyData {
 type HeartbeatMessage struct {
 	Op int   `json:"op"`
 	D  int64 `json:"d"`
+}
+
+type ResumeMessage struct {
+	Op int        `json:"op"`
+	D  ResumeData `json:"d"`
+}
+
+type ResumeData struct {
+	Token     string `json:"token"`
+	SessionID string `json:"session_id"`
+	Sequence  int64  `json:"seq"`
+}
+
+type Packet struct {
+	Op int             `json:"op"`
+	T  string          `json:"t"`
+	D  json.RawMessage `json:"d"`
+	S  int64           `json:"s"`
 }
