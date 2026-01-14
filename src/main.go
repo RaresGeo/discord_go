@@ -39,7 +39,18 @@ func main() {
 		cancel()
 	}()
 
-	if err := bot.ConnectToGateway(ctx); err != nil {
-		log.Fatalf("Failed to connect to gateway: %v", err)
+	// Run bot (blocks until context is cancelled or error occurs)
+	err = bot.ConnectToGateway(ctx)
+
+	// Gracefully disconnect
+	if disconnectErr := bot.Disconnect(); disconnectErr != nil {
+		log.Printf("Error during disconnect: %v", disconnectErr)
 	}
+
+	// Check if connection error was due to shutdown or actual error
+	if err != nil && err != context.Canceled {
+		log.Fatalf("Gateway connection error: %v", err)
+	}
+
+	log.Println("Shutdown complete")
 }

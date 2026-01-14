@@ -7,7 +7,6 @@ import (
 	"net/http"
 )
 
-// getChannel fetches a Discord channel by ID
 func (c *Client) getChannel(channelId string) (Channel, error) {
 	requestURL := DiscordAPI + "/channels/" + channelId
 
@@ -17,11 +16,7 @@ func (c *Client) getChannel(channelId string) (Channel, error) {
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bot %s", c.token))
 
-	c.mu.RLock()
-	client := c.httpClient
-	c.mu.RUnlock()
-
-	res, err := client.Do(req)
+	res, err := c.httpClient.Do(req)
 	if err != nil {
 		return Channel{}, fmt.Errorf("error making http request: %w", err)
 	}
